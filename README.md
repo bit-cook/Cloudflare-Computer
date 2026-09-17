@@ -60,6 +60,10 @@ public surface. Each is a Worker workspace with its own README.
 - [`examples/worker-javascript`](examples/worker-javascript) — mirrors
   `worker-shell`, but `exec` evaluates an ECMAScript module in a Dynamic
   Worker instead of running a shell command.
+- [`examples/browser-rendering`](examples/browser-rendering) — installs the
+  Puppeteer plugin in the Worker JavaScript backend, then scrapes pages and
+  writes Markdown, JSON, and screenshot bundles to the durable workspace from
+  one isolated execution.
 - [`examples/egress`](examples/egress) — sends one URL through the container,
   Worker shell, and Worker JavaScript backends with matching `none`, `all`, or
   custom egress policies.

@@ -16,12 +16,25 @@ import type {
 import { decodeRuntimeFrames, type RuntimeFrame } from "./frames.js";
 import { buildModuleGraph } from "./module-graph.js";
 
+export interface WorkerJavaScriptPlugin {
+  /** ECMAScript modules installed for every execution. */
+  modules: Record<string, string>;
+  /**
+   * Host bindings exposed to installed plugin modules through the reserved
+   * plugin bridge. Plugins on one backend are mutually trusted.
+   */
+  bindings?: Record<string, unknown>;
+}
+
 export interface WorkerJavaScriptBackendOptions {
-  loader: WorkspaceRuntimeLoader;
+  loader: WorkspaceRuntimeLoader<unknown>;
   id?: string;
   root?: string;
   access?: WorkspaceRuntimeAccess;
+  /** Host-installed code without access to the plugin binding bridge. */
   modules?: Record<string, string>;
+  /** Prebuilt, mutually trusted modules that carry the host bindings they need. */
+  plugins?: readonly WorkerJavaScriptPlugin[];
   /**
    * Host-owned capability modules installed under reserved ws:* specifiers.
    * Caller source may import them, but cannot provide or replace them.
@@ -29,7 +42,10 @@ export interface WorkerJavaScriptBackendOptions {
   trustedModules?: Record<`ws:${string}`, WorkspaceTrustedModule>;
   defaultTimeoutMs?: number;
   maxTimeoutMs?: number;
+  /** Caller-owned entry and relative module bytes. Defaults to 1 MiB. */
   maxSourceBytes?: number;
+  /** Complete Worker Loader graph bytes, including configured modules. Defaults to 8 MiB. */
+  maxLoaderSourceBytes?: number;
   maxInputBytes?: number;
   maxStdinBytes?: number;
   maxEnvBytes?: number;
@@ -70,6 +86,7 @@ type ResolvedWorkerJavaScriptBackendOptions = Required<
     | "defaultTimeoutMs"
     | "maxTimeoutMs"
     | "maxSourceBytes"
+    | "maxLoaderSourceBytes"
     | "maxInputBytes"
     | "maxStdinBytes"
     | "maxEnvBytes"
@@ -90,8 +107,10 @@ type ResolvedWorkerJavaScriptBackendOptions = Required<
     | "compatibilityFlags"
   >
 > &
-  Omit<WorkerJavaScriptBackendOptions, "egress" | "globalOutbound"> & {
+  Omit<WorkerJavaScriptBackendOptions, "egress" | "globalOutbound" | "plugins"> & {
     egress: WorkspaceEgressPolicy;
+    pluginBindings: Record<string, unknown>;
+    pluginModuleNames: ReadonlySet<string>;
   };
 
 interface WorkspaceExecutionContext {
@@ -152,6 +171,7 @@ export class WorkerJavaScriptBackend implements WorkspaceModuleBackend {
     assertPositiveFinite(maxTimeoutMs, "maxTimeoutMs");
     assertPositiveFinite(defaultTimeoutMs, "defaultTimeoutMs");
     assertPositiveFinite(options.maxSourceBytes ?? 1024 * 1024, "maxSourceBytes");
+    assertPositiveFinite(options.maxLoaderSourceBytes ?? 8 * 1024 * 1024, "maxLoaderSourceBytes");
     assertPositiveFinite(options.maxInputBytes ?? 1024 * 1024, "maxInputBytes");
     assertPositiveFinite(options.maxStdinBytes ?? 256 * 1024, "maxStdinBytes");
     assertPositiveFinite(options.maxEnvBytes ?? 1024 * 1024, "maxEnvBytes");
@@ -187,7 +207,8 @@ export class WorkerJavaScriptBackend implements WorkspaceModuleBackend {
     if (defaultTimeoutMs > maxTimeoutMs) {
       throw new Error("WorkerJavaScriptBackend defaultTimeoutMs cannot exceed maxTimeoutMs.");
     }
-    const { globalOutbound, egress, ...backendOptions } = options;
+    const { globalOutbound, egress, plugins, ...backendOptions } = options;
+    const pluginConfiguration = resolvePlugins(options.modules, plugins);
     const resolvedEgress =
       egress ??
       (globalOutbound === undefined
@@ -197,12 +218,16 @@ export class WorkerJavaScriptBackend implements WorkspaceModuleBackend {
           : { mode: "http-gateway" as const, gateway: globalOutbound });
     this.#options = {
       ...backendOptions,
+      modules: pluginConfiguration.modules,
+      pluginBindings: pluginConfiguration.bindings,
+      pluginModuleNames: pluginConfiguration.moduleNames,
       egress: resolvedEgress,
       root: options.root ?? "/workspace",
       access: options.access ?? "read-write",
       defaultTimeoutMs,
       maxTimeoutMs,
       maxSourceBytes: options.maxSourceBytes ?? 1024 * 1024,
+      maxLoaderSourceBytes: options.maxLoaderSourceBytes ?? 8 * 1024 * 1024,
       maxInputBytes: options.maxInputBytes ?? 1024 * 1024,
       maxStdinBytes: options.maxStdinBytes ?? 256 * 1024,
       maxEnvBytes: options.maxEnvBytes ?? 1024 * 1024,
@@ -354,6 +379,7 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
         cwd: input.cwd ?? this.#options.root,
         capability,
         configuredModules: this.#options.modules ?? {},
+        pluginModuleNames: this.#options.pluginModuleNames,
         trustedModuleNames: Object.keys(this.#options.trustedModules ?? {}),
         maxSourceBytes: this.#options.maxSourceBytes,
         maxCapabilityBytes: this.#options.maxCapabilityBytes,
@@ -420,7 +446,8 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
           compatibilityDate: this.#options.compatibilityDate,
           compatibilityFlags: this.#options.compatibilityFlags,
           maxStdioBytes: this.#options.maxStdioBytes,
-          maxSourceBytes: this.#options.maxSourceBytes,
+          maxLoaderSourceBytes: this.#options.maxLoaderSourceBytes,
+          pluginBindings: this.#options.pluginBindings,
           onComplete: () => this.#finalize(record),
           onError: (message) => this.#finalize(record, message),
         });
@@ -924,7 +951,7 @@ function decodeEvent(
 }
 
 function startJavaScriptExecution(options: {
-  loader: WorkspaceRuntimeLoader;
+  loader: WorkspaceRuntimeLoader<unknown>;
   modules: Record<string, string | { js?: string }>;
   entryName: string;
   input: WorkspaceRuntimeValue;
@@ -935,7 +962,8 @@ function startJavaScriptExecution(options: {
   compatibilityDate: string;
   compatibilityFlags: string[];
   maxStdioBytes: number;
-  maxSourceBytes: number;
+  maxLoaderSourceBytes: number;
+  pluginBindings: Record<string, unknown>;
   onComplete(): void | Promise<void>;
   onError(message: string): void | Promise<void>;
 }): ActiveControl {
@@ -943,15 +971,19 @@ function startJavaScriptExecution(options: {
     ...options.modules,
     "workspace-runtime-runner.js": runtimeWorkerModule(options.entryName, options.maxStdioBytes),
   };
-  assertLoaderGraph(modules, options.maxSourceBytes);
+  assertLoaderGraph(modules, options.maxLoaderSourceBytes);
   const worker = options.loader.load({
     compatibilityDate: options.compatibilityDate,
     compatibilityFlags: options.compatibilityFlags,
     limits: { cpuMs: options.timeoutMs },
     mainModule: "workspace-runtime-runner.js",
     modules,
+    env: options.pluginBindings,
     ...dynamicWorkerEgress(options.egress),
-  });
+  }) as {
+    getEntrypoint(name?: string, options?: { limits?: { cpuMs?: number } }): unknown;
+    [Symbol.dispose]?: () => void;
+  };
   let entrypoint: JavaScriptEntrypoint;
   try {
     entrypoint = worker.getEntrypoint(undefined, {
@@ -1028,6 +1060,7 @@ function runtimeWorkerModule(entryName: string, maxStdioBytes: number) {
   return `
     import { WorkerEntrypoint } from "cloudflare:workers";
     import { install } from "workspace-capabilities.js";
+    import { install as installPluginBindings } from "workspace-plugin-bindings.js";
 
     export default class extends WorkerEntrypoint {
       async evaluate(input, host, context) {
@@ -1164,6 +1197,7 @@ function runtimeWorkerModule(entryName: string, maxStdioBytes: number) {
           return "";
         };
         install(host);
+        installPluginBindings(this.env);
         // Hand the readable end to the host, which drains it live while
         // this call stays in flight. Keeping evaluate in flight is what
         // holds the host bridge stub alive for the whole run; frames
@@ -1190,6 +1224,52 @@ function runtimeWorkerModule(entryName: string, maxStdioBytes: number) {
       }
     }
   `;
+}
+
+function resolvePlugins(
+  modules: Record<string, string> | undefined,
+  plugins: readonly WorkerJavaScriptPlugin[] | undefined,
+): {
+  modules: Record<string, string>;
+  bindings: Record<string, unknown>;
+  moduleNames: ReadonlySet<string>;
+} {
+  const resolvedModules = Object.assign(Object.create(null), modules ?? {}) as Record<
+    string,
+    string
+  >;
+  const bindings = Object.create(null) as Record<string, unknown>;
+  const moduleNames = new Set<string>();
+  for (const plugin of plugins ?? []) {
+    for (const [name, source] of Object.entries(plugin.modules)) {
+      if (Object.hasOwn(resolvedModules, name)) {
+        throw new Error(
+          `Worker JavaScript plugin module ${JSON.stringify(name)} is configured twice.`,
+        );
+      }
+      resolvedModules[name] = source;
+      moduleNames.add(name);
+    }
+    for (const [name, binding] of Object.entries(plugin.bindings ?? {})) {
+      if (
+        !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name) ||
+        name === "__proto__" ||
+        name === "constructor" ||
+        name === "prototype"
+      ) {
+        throw new Error(
+          `Worker JavaScript plugin binding name ${JSON.stringify(name)} must be a safe simple identifier.`,
+        );
+      }
+      if (Object.hasOwn(bindings, name)) {
+        throw new Error(
+          `Worker JavaScript plugin binding ${JSON.stringify(name)} is configured twice.`,
+        );
+      }
+      bindings[name] = binding;
+    }
+  }
+  return { modules: resolvedModules, bindings: { ...bindings }, moduleNames };
 }
 
 function assertLoaderGraph(

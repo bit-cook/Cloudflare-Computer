@@ -229,6 +229,49 @@ describe("WorkerJavaScriptBackend", () => {
     expect(workerDisposals).toBe(1);
   });
 
+  it.each([
+    ["timeout", "failed"],
+    ["cancellation", "cancelled"],
+  ] as const)("disposes Loader resources after %s", async (mode, expectedStatus) => {
+    let entrypointDisposals = 0;
+    let workerDisposals = 0;
+    const workspace = new Workspace({
+      storage: new SQLiteTestStorage(),
+      backends: [
+        new WorkerJavaScriptBackend({
+          loader: {
+            load() {
+              return {
+                getEntrypoint() {
+                  return {
+                    evaluate: () => new Promise<void>(() => undefined),
+                    [Symbol.dispose]() {
+                      entrypointDisposals += 1;
+                    },
+                  };
+                },
+                [Symbol.dispose]() {
+                  workerDisposals += 1;
+                },
+              };
+            },
+          },
+          defaultTimeoutMs: 100,
+          maxTimeoutMs: 100,
+        }),
+      ],
+    });
+    await workspace.fs.mkdir("/workspace", { recursive: true });
+    const execution = await workspace.runtime.exec("export default 1", {
+      timeoutMs: mode === "timeout" ? 5 : 100,
+    });
+    if (mode === "cancellation") await workspace.runtime.killExec(execution.id);
+
+    await expect(execution.result()).resolves.toMatchObject({ status: expectedStatus });
+    expect(entrypointDisposals).toBe(1);
+    expect(workerDisposals).toBe(1);
+  });
+
   it("migrates the legacy execution journal schema", async () => {
     const db = new Database(new SQLiteTestStorage());
     initializeSchema(db, () => 0);
@@ -372,7 +415,7 @@ describe("WorkerJavaScriptBackend", () => {
     const load = vi.fn();
     const workspace = new Workspace({
       storage: new SQLiteTestStorage(),
-      backends: [new WorkerJavaScriptBackend({ loader: { load }, maxSourceBytes: 128 })],
+      backends: [new WorkerJavaScriptBackend({ loader: { load }, maxLoaderSourceBytes: 128 })],
     });
     await workspace.fs.mkdir("/workspace", { recursive: true });
     const execution = await workspace.runtime.exec("export default 1", { encoding: "utf8" });
@@ -381,6 +424,49 @@ describe("WorkerJavaScriptBackend", () => {
       stderr: expect.stringContaining("loader graph exceeds 128 source bytes"),
     });
     expect(load).not.toHaveBeenCalled();
+  });
+
+  it("installs one canonical copy of a configured module across nested imports", async () => {
+    const load = vi.fn(() => ({
+      getEntrypoint() {
+        return {
+          evaluate: (
+            _input: unknown,
+            host: {
+              assertResult(value: unknown): Promise<void>;
+              attachOutput(readable: ReadableStream<Uint8Array>): Promise<void>;
+            },
+          ) => evaluateResult(host, null),
+        };
+      },
+    }));
+    const configuredSource = `export default ${JSON.stringify("x".repeat(350_000))};`;
+    const workspace = new Workspace({
+      storage: new SQLiteTestStorage(),
+      backends: [
+        new WorkerJavaScriptBackend({
+          loader: { load },
+          maxSourceBytes: 1024,
+          maxLoaderSourceBytes: 512 * 1024,
+          plugins: [{ modules: { "@example/large": configuredSource } }],
+        }),
+      ],
+    });
+    await workspace.fs.mkdir("/workspace/a/b", { recursive: true });
+    await workspace.fs.writeFile("/workspace/a/one.js", `import "./b/two.js";`);
+    await workspace.fs.writeFile("/workspace/a/b/two.js", `export default 2;`);
+
+    const execution = await workspace.runtime.exec(
+      `import "./a/one.js"; import value from "@example/large"; export default value.length;`,
+    );
+    await expect(execution.result()).resolves.toMatchObject({ status: "completed" });
+
+    const loaderModules = load.mock.calls[0]?.[0].modules;
+    expect(
+      Object.values(loaderModules).filter(
+        (module) => (typeof module === "string" ? module : module.js) === configuredSource,
+      ),
+    ).toHaveLength(1);
   });
 
   it("records synchronous loader startup failure as a completed failed execution", async () => {
@@ -995,6 +1081,144 @@ describe("WorkerJavaScriptBackend", () => {
     const rejected = await handle.getExec({ id: "subscribers", after: "tail" });
     await expect(rejected.events.getReader().read()).rejects.toMatchObject({ code: "EEXEC_BUSY" });
     await handle.close();
+  });
+
+  it("passes plugin bindings and scoped modules to the Dynamic Worker", async () => {
+    const browser = { fetch: vi.fn() };
+    const load = vi.fn(() => ({
+      getEntrypoint() {
+        return {
+          evaluate: (
+            _input: unknown,
+            host: {
+              assertResult(value: unknown): Promise<void>;
+              attachOutput(readable: ReadableStream<Uint8Array>): Promise<void>;
+            },
+          ) => evaluateResult(host, null),
+        };
+      },
+    }));
+    const workspace = new Workspace({
+      storage: new SQLiteTestStorage(),
+      backends: [
+        new WorkerJavaScriptBackend({
+          loader: { load },
+          plugins: [
+            {
+              modules: {
+                "@cloudflare/puppeteer": "export const browser = true;",
+              },
+              bindings: { BROWSER: browser },
+            },
+          ],
+        }),
+      ],
+    });
+    await workspace.fs.mkdir("/workspace", { recursive: true });
+
+    await (
+      await workspace.runtime.exec(
+        `import { browser } from "@cloudflare/puppeteer"; export default browser;`,
+      )
+    ).result();
+
+    expect(load.mock.calls[0]?.[0].env).toEqual({ BROWSER: browser });
+    expect(
+      load.mock.calls[0]?.[0].modules["workspace-configured-modules/@cloudflare/puppeteer"],
+    ).toEqual({ js: "export const browser = true;" });
+    expect(load.mock.calls[0]?.[0].modules["workspace/@cloudflare/puppeteer"]).toEqual({
+      js: expect.stringContaining("workspace-configured-modules/@cloudflare/puppeteer"),
+    });
+    expect(load.mock.calls[0]?.[0].modules["workspace-plugin-bindings.js"]).toEqual({
+      js: expect.stringContaining("Object.hasOwn"),
+    });
+  });
+
+  it("rejects caller imports of the plugin binding bridge", async () => {
+    const load = vi.fn();
+    const workspace = new Workspace({
+      storage: new SQLiteTestStorage(),
+      backends: [new WorkerJavaScriptBackend({ loader: { load } })],
+    });
+    await workspace.fs.mkdir("/workspace", { recursive: true });
+
+    await expect(
+      workspace.runtime.exec(`import "workspace-plugin-bindings.js"; export default null;`),
+    ).rejects.toThrow(/reserved for Workspace internals/);
+    expect(load).not.toHaveBeenCalled();
+  });
+
+  it("rejects configured non-plugin imports of the plugin binding bridge", async () => {
+    const load = vi.fn();
+    const workspace = new Workspace({
+      storage: new SQLiteTestStorage(),
+      backends: [
+        new WorkerJavaScriptBackend({
+          loader: { load },
+          modules: {
+            sneaky: `import { binding } from "workspace-plugin-bindings.js"; export default binding("BROWSER");`,
+          },
+          plugins: [
+            {
+              modules: { plugin: "export default null;" },
+              bindings: { BROWSER: { fetch: vi.fn() } },
+            },
+          ],
+        }),
+      ],
+    });
+    await workspace.fs.mkdir("/workspace", { recursive: true });
+
+    await expect(
+      workspace.runtime.exec(`import value from "sneaky"; export default value;`),
+    ).rejects.toThrow(/reserved for installed plugin modules/);
+    expect(load).not.toHaveBeenCalled();
+  });
+
+  it("rejects malformed and prototype-like plugin binding names", () => {
+    for (const name of ["not a binding", "__proto__", "constructor", "prototype"]) {
+      const bindings = Object.create(null) as Record<string, unknown>;
+      bindings[name] = {};
+      expect(
+        () =>
+          new WorkerJavaScriptBackend({
+            loader: throwingLoader("unused"),
+            plugins: [{ modules: { plugin: "export default null" }, bindings }],
+          }),
+      ).toThrow(/plugin binding name.*safe simple identifier/);
+    }
+  });
+
+  it("rejects duplicate plugin modules and bindings", () => {
+    const plugin = {
+      modules: { plugin: "export default null" },
+      bindings: { PLUGIN: { fetch: vi.fn() } },
+    };
+    expect(
+      () =>
+        new WorkerJavaScriptBackend({
+          loader: throwingLoader("unused"),
+          plugins: [plugin, plugin],
+        }),
+    ).toThrow(/plugin module.*configured twice/);
+    expect(
+      () =>
+        new WorkerJavaScriptBackend({
+          loader: throwingLoader("unused"),
+          modules: { plugin: "export default null" },
+          plugins: [plugin],
+        }),
+    ).toThrow(/plugin module.*configured twice/);
+    expect(
+      () =>
+        new WorkerJavaScriptBackend({
+          loader: throwingLoader("unused"),
+          plugins: [
+            { modules: { one: "export default 1" }, bindings: plugin.bindings },
+            { modules: { two: "export default 2" }, bindings: plugin.bindings },
+          ],
+        }),
+    ).toThrow(/plugin binding.*configured twice/);
   });
 
   it("rejects malformed host trusted-module names", async () => {

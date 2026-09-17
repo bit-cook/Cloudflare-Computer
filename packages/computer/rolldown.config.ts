@@ -34,6 +34,7 @@ export default defineConfig({
     "backends/container/index": "src/backends/container/index.ts",
     "backends/worker-javascript/index": "src/backends/worker-javascript/index.ts",
     "backends/worker-shell/index": "src/backends/worker-shell/index.ts",
+    "plugins/puppeteer/index": "src/plugins/puppeteer/index.ts",
     // The shell-module groups build-bundle.mjs emits. Each is its
     // own entry so it lands at the dist path the ./shell/* package
     // exports point at; shell-modules.ts imports the core group by
